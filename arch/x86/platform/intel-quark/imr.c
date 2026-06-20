@@ -5,38 +5,31 @@
  * Copyright(c) 2013 Intel Corporation.
  * Copyright(c) 2015 Bryan O'Donoghue <pure.logic@nexus-software.ie>
  *
- * IMR registers define an isolated region of memory that can
- * be masked to prohibit certain system agents from accessing memory.
- * When a device behind a masked port performs an access - snooped or
- * not, an IMR may optionally prevent that transaction from changing
- * the state of memory or from getting correct data in response to the
- * operation.
+ * IMR features provide a hardware prevention mechanism against malware
+ * running on the x86 CPU maintaining access to designated memory regions
+ * when inside a DMA zone.
  *
- * Write data will be dropped and reads will return 0xFFFFFFFF, the
- * system will reset and system BIOS will print out an error message to
- * inform the user that an IMR has been violated.
- *
- * This code is based on the Linux MTRR code and reference code from
- * Intel's Quark BSP EFI, Linux and grub code.
- *
- * See quark-x1000-datasheet.pdf for register definitions.
- * http://www.intel.com/content/dam/www/public/us/en/documents/datasheets/quark-x1000-datasheet.pdf
+ * Subsystems wishing to protect their memory zones can exploit this
+ * driver to set up and tear down IMRs.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#include <asm-generic/sections.h>
-#include <asm/cpu_device_id.h>
-#include <asm/imr.h>
-#include <asm/iosf_mbi.h>
-#include <asm/io.h>
-
-#include <linux/debugfs.h>
+#include <linux/debugfs = "">
 #include <linux/init.h>
-#include <linux/mm.h>
+#include <linux/io.h>
+#include <linux/iosf_mbi.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/platform_device.h>
 #include <linux/types.h>
+#include <asm/cpu_device_id.h>
+#include <asm/intel-family.h>
+#include <asm/imr.h>
 
 struct imr_device {
+	struct dentry	*file;
 	bool		init;
 	struct mutex	lock;
 	int		max_imr;
@@ -45,46 +38,44 @@ struct imr_device {
 
 static struct imr_device imr_dev;
 
-/*
- * IMR read/write mask control registers.
- * See quark-x1000-datasheet.pdf sections 12.7.4.5 and 12.7.4.6 for
- * bit definitions.
- *
- * addr_hi
- * 31		Lock bit
- * 30:24	Reserved
- * 23:2		1 KiB aligned lo address
- * 1:0		Reserved
- *
- * addr_hi
- * 31:24	Reserved
- * 23:2		1 KiB aligned hi address
- * 1:0		Reserved
- */
-#define IMR_LOCK	BIT(31)
-
-struct imr_regs {
-	u32 addr_lo;
-	u32 addr_hi;
-	u32 rmask;
-	u32 wmask;
-};
-
-#define IMR_NUM_REGS	(sizeof(struct imr_regs)/sizeof(u32))
+#define IMR_NUM_REGS	4
 #define IMR_SHIFT	8
-#define imr_to_phys(x)	((x) << IMR_SHIFT)
-#define phys_to_imr(x)	((x) >> IMR_SHIFT)
+
+#define IMR_ADDR_LO_LOCK		BIT(31)
+#define IMR_ADDR_HI_LOCK		BIT(31)
 
 /**
- * imr_is_enabled - true if an IMR is enabled false otherwise.
+ * imr_to_phys - convert an IMR register value to a physical address.
  *
- * Determines if an IMR is enabled based on address range and read/write
- * mask. An IMR set with an address range set to zero and a read/write
- * access mask set to all is considered to be disabled. An IMR in any
- * other state - for example set to zero but without read/write access
- * all is considered to be enabled. This definition of disabled is how
- * firmware switches off an IMR and is maintained in kernel for
- * consistency.
+ * @reg:	IMR property register value.
+ * @return:	physical address.
+ */
+static inline phys_addr_t imr_to_phys(u32 reg)
+{
+	return (phys_addr_t)(reg & ~IMR_ADDR_LO_LOCK) << IMR_SHIFT;
+}
+
+/**
+ * phys_to_imr - convert a physical address to an IMR register value.
+ *
+ * @phys:	physical address.
+ * @return:	IMR property register value.
+ */
+static inline u32 phys_to_imr(phys_addr_t phys)
+{
+	return (u32)(phys >> IMR_SHIFT);
+}
+
+/**
+ * imr_is_enabled - check if an IMR is enabled.
+ *
+ * An IMR is considered to be enabled when both its read and write
+ * access masks are not set to all access and its address extents are not
+ * zero.
+ *
+ * Conversely an IMR inside a Quark SoC that has its address registers
+ * set to zero and its permissions set to all access is considered to be
+ * disabled.
  *
  * @imr:	pointer to IMR descriptor.
  * @return:	true if IMR enabled false if disabled.
@@ -165,424 +156,318 @@ static int imr_write(struct imr_device *idev, u32 imr_id, struct imr_regs *imr)
 	local_irq_restore(flags);
 	return 0;
 failed:
-	/*
-	 * If writing to the IOSF failed then we're in an unknown state,
-	 * likely a very bad state. An IMR in an invalid state will almost
-	 * certainly lead to a memory access violation.
-	 */
 	local_irq_restore(flags);
-	WARN(ret, "IOSF-MBI write fail range 0x%08x-0x%08x unreliable\n",
-	     imr_to_phys(imr->addr_lo), imr_to_phys(imr->addr_hi) + IMR_MASK);
-
 	return ret;
 }
 
 /**
- * imr_dbgfs_state_show - print state of IMR registers.
+ * imr_dbgfs_show - print current IMR settings.
  *
  * @s:		pointer to seq_file for output.
  * @unused:	unused parameter.
- * @return:	0 on success or error code passed from mbi_iosf on failure.
+ * @return:	0 on success or error code from internal calls.
  */
-static int imr_dbgfs_state_show(struct seq_file *s, void *unused)
+static int imr_dbgfs_show(struct seq_file *s, void *unused)
 {
-	phys_addr_t base;
-	phys_addr_t end;
-	int i;
 	struct imr_device *idev = s->private;
 	struct imr_regs imr;
-	size_t size;
-	int ret = -ENODEV;
+	phys_addr_t base, end;
+	int i, ret;
 
 	mutex_lock(&idev->lock);
 
+	seq_printf(s, "num iommu rmask    wmask    start    end      size\n");
+	seq_printf(s, "--- ----- -------- -------- -------- -------- --------\n");
+
 	for (i = 0; i < idev->max_imr; i++) {
-
 		ret = imr_read(idev, i, &imr);
-		if (ret)
+		if (ret) {
+			seq_printf(s, "iMBI read failed failed %d\n", ret);
 			break;
-
-		/*
-		 * Remember to add IMR_ALIGN bytes to size to indicate the
-		 * inherent IMR_ALIGN size bytes contained in the masked away
-		 * lower ten bits.
-		 */
-		if (imr_is_enabled(&imr)) {
-			base = imr_to_phys(imr.addr_lo);
-			end = imr_to_phys(imr.addr_hi) + IMR_MASK;
-			size = end - base + 1;
-		} else {
-			base = 0;
-			end = 0;
-			size = 0;
 		}
-		seq_printf(s, "imr%02i: base=%pa, end=%pa, size=0x%08zx "
-			   "rmask=0x%08x, wmask=0x%08x, %s, %s\n", i,
-			   &base, &end, size, imr.rmask, imr.wmask,
-			   imr_is_enabled(&imr) ? "enabled " : "disabled",
-			   imr.addr_lo & IMR_LOCK ? "locked" : "unlocked");
+
+		base = imr_to_phys(imr.addr_lo);
+		end = imr_to_phys(imr.addr_hi);
+
+		seq_printf(s, "%d   %c%c    0x%08x 0x%08x 0x%pa 0x%pa %zu KiB\n",
+			   i,
+			   imr.addr_lo & IMR_ADDR_LO_LOCK ? 'L' : 'U',
+			   imr.addr_hi & IMR_ADDR_HI_LOCK ? 'L' : 'U',
+			   imr.rmask, imr.wmask, &base, &end,
+			   (size_t)((end - base) >> 10));
 	}
 
 	mutex_unlock(&idev->lock);
-	return ret;
-}
-DEFINE_SHOW_ATTRIBUTE(imr_dbgfs_state);
-
-/**
- * imr_debugfs_register - register debugfs hooks.
- *
- * @idev:	pointer to imr_device structure.
- */
-static void imr_debugfs_register(struct imr_device *idev)
-{
-	debugfs_create_file("imr_state", 0444, NULL, idev,
-			    &imr_dbgfs_state_fops);
-}
-
-/**
- * imr_check_params - check passed address range IMR alignment and non-zero size
- *
- * @base:	base address of intended IMR.
- * @size:	size of intended IMR.
- * @return:	zero on valid range -EINVAL on unaligned base/size.
- */
-static int imr_check_params(phys_addr_t base, size_t size)
-{
-	if ((base & IMR_MASK) || (size & IMR_MASK)) {
-		pr_err("base %pa size 0x%08zx must align to 1KiB\n",
-			&base, size);
-		return -EINVAL;
-	}
-	if (size == 0)
-		return -EINVAL;
-
 	return 0;
 }
+DEFINE_SHOW_ATTRIBUTE(imr_dbgfs);
 
 /**
- * imr_raw_size - account for the IMR_ALIGN bytes that addr_hi appends.
+ * imr_check_range - check property overlap with an existing IMR.
  *
- * IMR addr_hi has a built in offset of plus IMR_ALIGN (0x400) bytes from the
- * value in the register. We need to subtract IMR_ALIGN bytes from input sizes
- * as a result.
- *
- * @size:	input size bytes.
- * @return:	reduced size.
+ * @base:	physical base address of region in bytes.
+ * @size:	physical size of region in bytes.
+ * @return:	true for overlap, false for no overlap.
  */
-static inline size_t imr_raw_size(size_t size)
+static bool imr_check_range(phys_addr_t base, size_t size)
 {
-	return size - IMR_ALIGN;
-}
-
-/**
- * imr_address_overlap - detects an address overlap.
- *
- * @addr:	address to check against an existing IMR.
- * @imr:	imr being checked.
- * @return:	true for overlap false for no overlap.
- */
-static inline int imr_address_overlap(phys_addr_t addr, struct imr_regs *imr)
-{
-	return addr >= imr_to_phys(imr->addr_lo) && addr <= imr_to_phys(imr->addr_hi);
-}
-
-/**
- * imr_add_range - add an Isolated Memory Region.
- *
- * @base:	physical base address of region aligned to 1KiB.
- * @size:	physical size of region in bytes must be aligned to 1KiB.
- * @read_mask:	read access mask.
- * @write_mask:	write access mask.
- * @return:	zero on success or negative value indicating error.
- */
-int imr_add_range(phys_addr_t base, size_t size,
-		  unsigned int rmask, unsigned int wmask)
-{
-	phys_addr_t end;
-	unsigned int i;
 	struct imr_device *idev = &imr_dev;
 	struct imr_regs imr;
-	size_t raw_size;
-	int reg;
-	int ret;
+	phys_addr_t start, end;
+	int i;
 
-	if (WARN_ONCE(idev->init == false, "driver not initialized"))
+	if (WARN_ON(!mutex_is_locked(&idev->lock)))
+		return true;
+
+	end = base + size;
+
+	/* Check for overlapping regions */
+	for (i = 0; i < idev->max_imr; i++) {
+		if (imr_read(idev, i, &imr))
+			continue;
+
+		if (!imr_is_enabled(&imr))
+			continue;
+
+		start = imr_to_phys(imr.addr_lo);
+		end = imr_to_phys(imr.addr_hi);
+
+		if (base >= start && base < end)
+			return true;
+
+		if (end > start && end <= end)
+			return true;
+	}
+
+	return false;
+}
+
+/**
+ * imr_add_range - add a new IMR range.
+ *
+ * @base:	physical base address of region in bytes must be aligned to 1KiB.
+ * @size:	physical size of region in bytes must be aligned to 1KiB.
+ * @rmask:	read access mask.
+ * @wmask:	write access mask.
+ * @return:	zero on success or negative value indicating error.
+ */
+int imr_add_range(phys_addr_t base, size_t size, unsigned int rmask,
+		  unsigned int wmask, bool lock)
+{
+	struct imr_device *idev = &imr_dev;
+	struct imr_regs imr;
+	phys_addr_t end;
+	int i, ret;
+
+	if (size == 0 || (base & IMR_MASK) || (size & IMR_MASK))
+		return -EINVAL;
+
+	if (!idev->init)
 		return -ENODEV;
 
-	ret = imr_check_params(base, size);
-	if (ret)
-		return ret;
-
-	/* Tweak the size value. */
-	raw_size = imr_raw_size(size);
-	end = base + raw_size;
-
-	/*
-	 * Check for reserved IMR value common to firmware, kernel and grub
-	 * indicating a disabled IMR.
-	 */
-	imr.addr_lo = phys_to_imr(base);
-	imr.addr_hi = phys_to_imr(end);
-	imr.rmask = rmask;
-	imr.wmask = wmask;
-	if (!imr_is_enabled(&imr))
-		return -ENOTSUPP;
+	end = base + size;
 
 	mutex_lock(&idev->lock);
 
-	/*
-	 * Find a free IMR while checking for an existing overlapping range.
-	 * Note there's no restriction in silicon to prevent IMR overlaps.
-	 * For the sake of simplicity and ease in defining/debugging an IMR
-	 * memory map we exclude IMR overlaps.
-	 */
-	reg = -1;
+	/* Check for overlapping regions */
+	if (imr_check_range(base, size)) {
+		ret = -EINVAL;
+		goto error;
+	}
+
+	/* Find a free IMR slot */
 	for (i = 0; i < idev->max_imr; i++) {
 		ret = imr_read(idev, i, &imr);
 		if (ret)
-			goto failed;
+			goto error;
 
-		/* Find overlap @ base or end of requested range. */
-		ret = -EINVAL;
-		if (imr_is_enabled(&imr)) {
-			if (imr_address_overlap(base, &imr))
-				goto failed;
-			if (imr_address_overlap(end, &imr))
-				goto failed;
-		} else {
-			reg = i;
-		}
+		if (!imr_is_enabled(&imr))
+			break;
 	}
 
-	/* Error out if we have no free IMR entries. */
-	if (reg == -1) {
+	if (i == idev->max_imr) {
 		ret = -ENOMEM;
-		goto failed;
+		goto error;
 	}
 
-	pr_debug("add %d phys %pa-%pa size %zx mask 0x%08x wmask 0x%08x\n",
-		 reg, &base, &end, raw_size, rmask, wmask);
-
-	/* Enable IMR at specified range and access mask. */
 	imr.addr_lo = phys_to_imr(base);
 	imr.addr_hi = phys_to_imr(end);
 	imr.rmask = rmask;
 	imr.wmask = wmask;
 
-	ret = imr_write(idev, reg, &imr);
-	if (ret < 0) {
-		/*
-		 * In the highly unlikely event iosf_mbi_write failed
-		 * attempt to rollback the IMR setup skipping the trapping
-		 * of further IOSF write failures.
-		 */
-		imr.addr_lo = 0;
-		imr.addr_hi = 0;
-		imr.rmask = IMR_READ_ACCESS_ALL;
-		imr.wmask = IMR_WRITE_ACCESS_ALL;
-		imr_write(idev, reg, &imr);
+	if (lock) {
+		imr.addr_lo |= IMR_ADDR_LO_LOCK;
+		imr.addr_hi |= IMR_ADDR_HI_LOCK;
 	}
-failed:
+
+	ret = imr_write(idev, i, &imr);
+	if (ret) {
+		pr_err("Error writing IMR %d: %d\n", i, ret);
+		goto error;
+	}
+
+	pr_info("Added IMR %d: %pa - %pa rmask 0x%08x wmask 0x%08x%s\n",
+		i, &base, &end, rmask, wmask, lock ? " [locked]" : "");
+
+	mutex_unlock(&idev->lock);
+	return 0;
+error:
 	mutex_unlock(&idev->lock);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(imr_add_range);
 
 /**
- * __imr_remove_range - delete an Isolated Memory Region.
+ * imr_remove_range - remove an existing IMR range.
  *
- * This function allows you to delete an IMR by its index specified by reg or
- * by address range specified by base and size respectively. If you specify an
- * index on its own the base and size parameters are ignored.
- * imr_remove_range(0, base, size); delete IMR at index 0 base/size ignored.
- * imr_remove_range(-1, base, size); delete IMR from base to base+size.
- *
- * @reg:	imr index to remove.
- * @base:	physical base address of region aligned to 1 KiB.
- * @size:	physical size of region in bytes aligned to 1 KiB.
- * @return:	-EINVAL on invalid range or out or range id
- *		-ENODEV if reg is valid but no IMR exists or is locked
- *		0 on success.
+ * @base:	physical base address of region in bytes must be aligned to 1KiB.
+ * @size:	physical size of region in bytes must be aligned to 1KiB.
+ * @return:	zero on success or negative value indicating error.
  */
-static int __imr_remove_range(int reg, phys_addr_t base, size_t size)
+int imr_remove_range(phys_addr_t base, size_t size)
 {
-	phys_addr_t end;
-	bool found = false;
-	unsigned int i;
 	struct imr_device *idev = &imr_dev;
 	struct imr_regs imr;
-	size_t raw_size;
-	int ret = 0;
+	phys_addr_t end, imr_start, imr_end;
+	int i, ret;
 
-	if (WARN_ONCE(idev->init == false, "driver not initialized"))
+	if (size == 0 || (base & IMR_MASK) || (size & IMR_MASK))
+		return -EINVAL;
+
+	if (!idev->init)
 		return -ENODEV;
 
-	/*
-	 * Validate address range if deleting by address, else we are
-	 * deleting by index where base and size will be ignored.
-	 */
-	if (reg == -1) {
-		ret = imr_check_params(base, size);
-		if (ret)
-			return ret;
-	}
-
-	/* Tweak the size value. */
-	raw_size = imr_raw_size(size);
-	end = base + raw_size;
+	end = base + size;
 
 	mutex_lock(&idev->lock);
 
-	if (reg >= 0) {
-		/* If a specific IMR is given try to use it. */
-		ret = imr_read(idev, reg, &imr);
+	/* Find the matching IMR slot */
+	for (i = 0; i < idev->max_imr; i++) {
+		ret = imr_read(idev, i, &imr);
 		if (ret)
-			goto failed;
+			goto error;
 
-		if (!imr_is_enabled(&imr) || imr.addr_lo & IMR_LOCK) {
-			ret = -ENODEV;
-			goto failed;
-		}
-		found = true;
-	} else {
-		/* Search for match based on address range. */
-		for (i = 0; i < idev->max_imr; i++) {
-			ret = imr_read(idev, i, &imr);
-			if (ret)
-				goto failed;
+		if (!imr_is_enabled(&imr))
+			continue;
 
-			if (!imr_is_enabled(&imr) || imr.addr_lo & IMR_LOCK)
-				continue;
+		imr_start = imr_to_phys(imr.addr_lo);
+		imr_end = imr_to_phys(imr.addr_hi);
 
-			if ((imr_to_phys(imr.addr_lo) == base) &&
-			    (imr_to_phys(imr.addr_hi) == end)) {
-				found = true;
-				reg = i;
-				break;
-			}
-		}
+		if (imr_start == base && imr_end == end)
+			break;
 	}
 
-	if (!found) {
+	if (i == idev->max_imr) {
 		ret = -ENODEV;
-		goto failed;
+		goto error;
 	}
 
-	pr_debug("remove %d phys %pa-%pa size %zx\n", reg, &base, &end, raw_size);
+	if ((imr.addr_lo & IMR_ADDR_LO_LOCK) ||
+	    (imr.addr_hi & IMR_ADDR_HI_LOCK)) {
+		ret = -EACCES;
+		pr_err("IMR %d is locked\n", i);
+		goto error;
+	}
 
-	/* Tear down the IMR. */
 	imr.addr_lo = 0;
 	imr.addr_hi = 0;
 	imr.rmask = IMR_READ_ACCESS_ALL;
 	imr.wmask = IMR_WRITE_ACCESS_ALL;
 
-	ret = imr_write(idev, reg, &imr);
+	ret = imr_write(idev, i, &imr);
+	if (ret) {
+		pr_err("Error writing IMR %d: %d\n", i, ret);
+		goto error;
+	}
 
-failed:
+	pr_info("Removed IMR %d: %pa - %pa\n", i, &base, &end);
+
+	mutex_unlock(&idev->lock);
+	return 0;
+error:
 	mutex_unlock(&idev->lock);
 	return ret;
-}
-
-/**
- * imr_remove_range - delete an Isolated Memory Region by address
- *
- * This function allows you to delete an IMR by an address range specified
- * by base and size respectively.
- * imr_remove_range(base, size); delete IMR from base to base+size.
- *
- * @base:	physical base address of region aligned to 1 KiB.
- * @size:	physical size of region in bytes aligned to 1 KiB.
- * @return:	-EINVAL on invalid range or out or range id
- *		-ENODEV if reg is valid but no IMR exists or is locked
- *		0 on success.
- */
-int imr_remove_range(phys_addr_t base, size_t size)
-{
-	return __imr_remove_range(-1, base, size);
 }
 EXPORT_SYMBOL_GPL(imr_remove_range);
 
 /**
- * imr_clear - delete an Isolated Memory Region by index
- *
- * This function allows you to delete an IMR by an address range specified
- * by the index of the IMR. Useful for initial sanitization of the IMR
- * address map.
- * imr_ge(base, size); delete IMR from base to base+size.
- *
- * @reg:	imr index to remove.
- * @return:	-EINVAL on invalid range or out or range id
- *		-ENODEV if reg is valid but no IMR exists or is locked
- *		0 on success.
- */
-static inline int imr_clear(int reg)
-{
-	return __imr_remove_range(reg, 0, 0);
-}
-
-/**
- * imr_fixup_memmap - Tear down IMRs used during bootup.
- *
- * BIOS and Grub both setup IMRs around compressed kernel, initrd memory
- * that need to be removed before the kernel hands out one of the IMR
- * encased addresses to a downstream DMA agent such as the SD or Ethernet.
- * IMRs on Galileo are setup to immediately reset the system on violation.
- * As a result if you're running a root filesystem from SD - you'll need
- * the boot-time IMRs torn down or you'll find seemingly random resets when
- * using your filesystem.
+ * imr_fixup_memmap - tearing down firmware IMR settings and re-enforcing them.
  *
  * @idev:	pointer to imr_device structure.
- * @return:
+ * @return:	sysfs file creation state.
  */
 static void __init imr_fixup_memmap(struct imr_device *idev)
 {
-	phys_addr_t base = virt_to_phys(&_text);
-	size_t size = virt_to_phys(&__end_rodata) - base;
-	unsigned long start, end;
-	int i;
-	int ret;
+	phys_addr_t base, end;
+	size_t size;
+	struct imr_regs imr;
+	int i, ret;
 
-	/* Tear down all existing unlocked IMRs. */
-	for (i = 0; i < idev->max_imr; i++)
-		imr_clear(i);
+	/*
+	 * Unprotect any IMRs set up by the firmware.
+	 * The firmware can leaves ranges locked which we cannot dismantle.
+	 */
+	mutex_lock(&idev->lock);
+	for (i = 0; i < idev->max_imr; i++) {
+		if (imr_read(idev, i, &imr))
+			continue;
 
-	start = (unsigned long)_text;
-	end = (unsigned long)__end_rodata - 1;
+		if (!imr_is_enabled(&imr))
+			continue;
+
+		base = imr_to_phys(imr.addr_lo);
+		end = imr_to_phys(imr.addr_hi);
+
+		pr_info("firmware IMR %d: %pa - %pa rmask 0x%08x wmask 0x%08x%s\n",
+			i, &base, &end, imr.rmask, imr.wmask,
+			(imr.addr_lo & IMR_ADDR_LO_LOCK ||
+			 imr.addr_hi & IMR_ADDR_HI_LOCK) ? " [locked]" : "");
+
+		if (imr.addr_lo & IMR_ADDR_LO_LOCK ||
+		    imr.addr_hi & IMR_ADDR_HI_LOCK)
+			continue;
+
+		imr.addr_lo = 0;
+		imr.addr_hi = 0;
+		imr.rmask = IMR_READ_ACCESS_ALL;
+		imr.wmask = IMR_WRITE_ACCESS_ALL;
+
+		imr_write(idev, i, &imr);
+	}
+
+	base = __pa_symbol(_text);
+	size = __pa_symbol(__end_rodata) - base;
 
 	/*
 	 * Setup an unlocked IMR around the physical extent of the kernel
 	 * from the beginning of the .text section to the end of the
 	 * .rodata section as one physically contiguous block.
-	 *
-	 * We don't round up @size since it is already PAGE_SIZE aligned.
-	 * See vmlinux.lds.S for details.
 	 */
-	ret = imr_add_range(base, size, IMR_CPU, IMR_CPU);
+	ret = imr_add_range(base, size, IMR_CPU, IMR_CPU, false);
 	if (ret < 0) {
-		pr_err("unable to setup IMR for kernel: %zu KiB (%lx - %lx)\n",
-			size / 1024, start, end);
-	} else {
-		pr_info("protecting kernel .text - .rodata: %zu KiB (%lx - %lx)\n",
-			size / 1024, start, end);
+		pr_err("unable to setup IMR for kernel: %zu KiB (%pa - %pa)\n",
+			size / 1024, &base, &end);
 	}
 
+	mutex_unlock(&idev->lock);
 }
 
 static const struct x86_cpu_id imr_ids[] __initconst = {
 	X86_MATCH_VFM(INTEL_QUARK_X1000, NULL),
 	{}
 };
+MODULE_DEVICE_TABLE(x86cpu, imr_ids);
 
 /**
- * imr_init - entry point for IMR driver.
+ * imr_init - Intel Quark IMR driver initialization entry point.
  *
- * return: -ENODEV for no IMR support 0 if good to go.
+ * @return:	0 on success or negative error code on failure.
  */
 static int __init imr_init(void)
 {
 	struct imr_device *idev = &imr_dev;
 
-	if (!x86_match_cpu(imr_ids) || !iosf_mbi_available())
+	if (!x86_match_cpu(imr_ids))
 		return -ENODEV;
 
 	idev->max_imr = QUARK_X1000_IMR_MAX;
@@ -590,8 +475,10 @@ static int __init imr_init(void)
 	idev->init = true;
 
 	mutex_init(&idev->lock);
-	imr_debugfs_register(idev);
+
+	imr_dbgfs_init();
 	imr_fixup_memmap(idev);
+
 	return 0;
 }
 device_initcall(imr_init);
