@@ -6,6 +6,7 @@
  * Copyright (c) 2002 Pavel Machek <pavel@ucw.cz>
  * Copyright (c) 2001 Patrick Mochel <mochel@osdl.org>
  */
+
 #include <linux/gfp.h>
 #include <linux/smp.h>
 #include <linux/suspend.h>
@@ -15,7 +16,6 @@
 #include <linux/pgtable.h>
 #include <linux/types.h>
 #include <linux/crc32.h>
-
 #include <asm/e820/api.h>
 #include <asm/init.h>
 #include <asm/proto.h>
@@ -73,7 +73,7 @@ struct restore_data_record {
 static inline u32 compute_e820_crc32(struct e820_table *table)
 {
 	int size = offsetof(struct e820_table, entries) +
-		sizeof(struct e820_entry) * table->nr_entries;
+		   sizeof(struct e820_entry) * table->nr_entries;
 
 	return ~crc32_le(~0, (unsigned char const *)table, size);
 }
@@ -98,6 +98,7 @@ int arch_hibernation_header_save(void *addr, unsigned int max_size)
 
 	if (max_size < sizeof(struct restore_data_record))
 		return -EOVERFLOW;
+
 	rdr->magic = RESTORE_MAGIC;
 	rdr->jump_address = (unsigned long)restore_registers;
 	rdr->jump_address_phys = __pa_symbol(restore_registers);
@@ -120,8 +121,8 @@ int arch_hibernation_header_save(void *addr, unsigned int max_size)
 	 * have any of the PCID bits set.
 	 */
 	rdr->cr3 = restore_cr3 & ~CR3_PCID_MASK;
-
 	rdr->e820_checksum = compute_e820_crc32(e820_table_firmware);
+
 	return 0;
 }
 
@@ -166,25 +167,32 @@ int relocate_restore_code(void)
 	__memcpy((void *)relocated_restore_code, core_restore_code, PAGE_SIZE);
 
 	/* Make the page containing the relocated code executable */
-	pgd = (pgd_t *)__va(read_cr3_pa()) +
-		pgd_index(relocated_restore_code);
+	pgd = (pgd_t *)__va(read_cr3_pa()) + pgd_index(relocated_restore_code);
 	p4d = p4d_offset(pgd, relocated_restore_code);
 	if (p4d_leaf(*p4d)) {
 		set_p4d(p4d, __p4d(p4d_val(*p4d) & ~_PAGE_NX));
+		pr_info("PM: Stripped NX bit from restore code P4D\n");
 		goto out;
 	}
+
 	pud = pud_offset(p4d, relocated_restore_code);
 	if (pud_leaf(*pud)) {
 		set_pud(pud, __pud(pud_val(*pud) & ~_PAGE_NX));
+		pr_info("PM: Stripped NX bit from restore code PUD\n");
 		goto out;
 	}
+
 	pmd = pmd_offset(pud, relocated_restore_code);
 	if (pmd_leaf(*pmd)) {
 		set_pmd(pmd, __pmd(pmd_val(*pmd) & ~_PAGE_NX));
+		pr_info("PM: Stripped NX bit from restore code PMD\n");
 		goto out;
 	}
+
 	pte = pte_offset_kernel(pmd, relocated_restore_code);
 	set_pte(pte, __pte(pte_val(*pte) & ~_PAGE_NX));
+	pr_info("PM: Stripped NX bit from restore code PTE at 0x%lx\n", relocated_restore_code);
+
 out:
 	__flush_tlb_all();
 	return 0;
@@ -207,10 +215,13 @@ int arch_resume_nosmt(void)
 	 * Called with hotplug disabled.
 	 */
 	cpu_hotplug_enable();
-
 	ret = arch_cpu_rescan_dead_smt_siblings();
-
 	cpu_hotplug_disable();
+
+	if (ret) {
+		pr_warn("PM: SMT sibling rescan failed (%d), proceeding anyway.\n", ret);
+		return 0;
+	}
 
 	return ret;
 }
