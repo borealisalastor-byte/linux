@@ -1,9 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/*
- * CE4100 on Falcon Falls
- *
- * (c) Copyright 2010 Intel Corporation
- */
+
 /dts-v1/;
 / {
 	model = "intel,falconfalls";
